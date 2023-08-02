@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::LanguageExtensions
+Description: VPC stack
+Parameters:
+  ProjectName:
+    Type: String
+  Environment:
+    Type: String
+    Description: The environment to deploy
+  Amzn2023AMILatest:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64
+
+Conditions:
+  IsMaster: !Equals [ !Ref Environment, "master" ]
+
+Mappings:
+  # To convert the AZ letters to a 0-based index
+  IndexMappings:
+    Subnets:
+      list: ['A', 'B', 'C']
+      A: 0
+      B: 1
+      C: 2
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: 10.42.0.0/21
+      Tags:
+        - Key: Name
+          Value: !Sub vpc-${ProjectName}-${Environment}
+
+  # Public route table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub rt-${ProjectName}-public-${Environment}
+
+  # NAT instance
+  NATInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub scg-${ProjectName}-nat-${Environment}
+      GroupDescription: Allow to access from the VPC
+      SecurityGroupIngress:
+        - CidrIp: !GetAtt VPC.CidrBlock
+          IpProtocol: -1
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+      Tags:
+        - Key: Name
+          Value: !Sub scg-${ProjectName}-nat-${Environment}
+      VpcId: !Ref VPC
+  NATInstanceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: t4g.nano
+        ImageId: !Ref Amzn2023AMILatest
+        CreditSpecification:
+          CpuCredits: standard
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !GetAtt NATInstanceSG.GroupId
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              DeleteOnTermination: true
+              VolumeType: gp3
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash
+              # Enable NAT on iptables
+              dnf install -y iptables-services
+              systemctl enable iptables
+              systemctl start iptables
+              iface=$(ls /sys/class/net/ | grep '^en' |{ read first others ; echo $first; })
+              iptables -t nat -A POSTROUTING -o $iface -s ${VPC.CidrBlock} -j MASQUERADE
+              iptables -I FORWARD 1 -o $iface -j ACCEPT
+              service iptables save
+              # Enable IP forward on Kernel
+              echo 1 > /proc/sys/net/ipv4/ip_forward
+              echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/90-ipforward.conf
+              # Disable SSM & SSH
+              dnf erase -y amazon-ssm-agent openssh
+
+  Fn::ForEach::Subnets:
+  - index
+  - !FindInMap [IndexMappings, Subnets, list]
+  # Public subnets
+  - PublicSubnet${index}:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref VPC
+        CidrBlock: !Select
+          # In the following list of subnet, select the index mapped from the ForEach letter
+          - !FindInMap [IndexMappings, Subnets, !Sub '${index}']
+          # The VPC will be devided in 8 subnets
+          # This result in the list of the first 4 subnets
+          - !Cidr [!Select [0, !Cidr [!GetAtt VPC.CidrBlock, 2, 10]], 4, 8]
+        AvailabilityZone: !Select
+          # In the following list of AZs, select the index mapped from the ForEach letter
+          - !FindInMap [IndexMappings, Subnets, !Sub '${index}']
+          - !GetAZs ""
+        Tags:
+          - Key: Network
+            Value: Public
+          - Key: Name
+            Value: !Sub subnet-${ProjectName}-public-${index}-${Environment}
+    PublicSubnetRouteTableAssociation${index}:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: {Ref: !Sub 'PublicSubnet${index}'}
+        RouteTableId: !Ref PublicRouteTable
+    # Private subnets and NAT instances
+    PrivateSubnet${index}:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref VPC
+        CidrBlock: !Select
+          # In the following list of subnet, select the index mapped from the ForEach letter
+          - !FindInMap [IndexMappings, Subnets, !Sub '${index}']
+          # The VPC will be devided in 8 subnets
+          # This result in the list of the last 4 subnets
+          - !Cidr [!Select [1, !Cidr [!GetAtt VPC.CidrBlock, 2, 10]], 4, 8]
+        AvailabilityZone: !Select
+          # In the following list of AZs, select the index mapped from the ForEach letter
+          - !FindInMap [IndexMappings, Subnets, !Sub '${index}']
+          - !GetAZs ""
+        Tags:
+          - Key: Network
+            Value: Private
+          - Key: Name
+            Value: !Sub subnet-${ProjectName}-private-${index}-${Environment}
+    NATInstance${index}:
+      Type: AWS::EC2::Instance
+      Properties:
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            SubnetId: {Ref: !Sub 'PublicSubnet${index}'}
+        SourceDestCheck: false
+        LaunchTemplate:
+          LaunchTemplateId: !Ref NATInstanceLaunchTemplate
+          Version: !GetAtt NATInstanceLaunchTemplate.LatestVersionNumber
+        Tags:
+          - Key: Name
+            Value: !Sub ec2-${ProjectName}-nat-${index}-${Environment}
+    PrivateRouteTable${index}:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: !Sub rt-${ProjectName}-private-${index}-${Environment}
+    PrivateRoute${index}:
+      Type: AWS::EC2::Route
+      Properties:
+         RouteTableId: {Ref: !Sub 'PrivateRouteTable${index}'}
+         DestinationCidrBlock: 0.0.0.0/0
+         InstanceId: {Ref: !Sub 'NATInstance${index}'}
+    PrivateSubnetRouteTableAssociation${index}:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: {Ref: !Sub 'PrivateSubnet${index}'}
+        RouteTableId: {Ref: !Sub 'PrivateRouteTable${index}'}
+
+  # Internet gateway and pub routes
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub igw-${ProjectName}-${Environment}
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: 
+      InternetGatewayId: !Ref IGW
+      VpcId: !Ref VPC
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+       RouteTableId: !Ref PublicRouteTable
+       DestinationCidrBlock: 0.0.0.0/0
+       GatewayId: !Ref IGW
+
+  # Gateway VPC endpoints
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTableA
+        - !Ref PrivateRouteTableB
+        - !Ref PrivateRouteTableC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref VPC
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTableA
+        - !Ref PrivateRouteTableB
+        - !Ref PrivateRouteTableC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcId: !Ref VPC
+
+Outputs:
+  # VPC outputs
+  VPCID:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${ProjectName}:${Environment}:VPCID
+  VPCCIDR:
+    Description: VPC CIDR
+    Value: !GetAtt VPC.CidrBlock
+    Export:
+      Name: !Sub ${ProjectName}:${Environment}:VPCCIDR
+
+  # Subnet IDs outputs
+  Fn::ForEach::SubnetOutputs:
+  - index
+  - !FindInMap [IndexMappings, Subnets, list]
+  - Fn::ForEach::SubnetTypes:
+    - type
+    - [Public, Private]
+    - ${type}Subnet${index}ID:
+        Value: {Ref: !Sub '${type}Subnet${index}'}
+        Export:
+          Name: !Sub ${ProjectName}:${Environment}:${type}Subnet${index}ID
