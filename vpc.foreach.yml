@@ -14,8 +14,8 @@ Parameters:
 Mappings:
   # To convert the AZ letters to a 0-based index
   IndexMappings:
-    Subnets:
-      list: ['A', 'B', 'C']
+    AZ:
+      list: [A, B, C]
       A: 0
       B: 1
       C: 2
@@ -92,85 +92,85 @@ Resources:
               # Disable SSM & SSH
               dnf erase -y amazon-ssm-agent openssh
 
-  Fn::ForEach::Subnets:
-  - index
-  - !FindInMap [IndexMappings, Subnets, list]
+  Fn::ForEach::AZ:
+  - az
+  - !FindInMap [IndexMappings, AZ, list]
   # Public subnets
-  - PublicSubnet${index}:
+  - PublicSubnet${az}:
       Type: AWS::EC2::Subnet
       Properties:
         VpcId: !Ref VPC
         CidrBlock: !Select
           # In the following list of subnet, select the index mapped from the ForEach letter
-          - !FindInMap [IndexMappings, Subnets, !Sub '${index}']
+          - !FindInMap [IndexMappings, AZ, !Sub '${az}']
           # The VPC will be devided in 8 subnets
           # This result in the list of the first 4 subnets
           - !Cidr [!Select [0, !Cidr [!GetAtt VPC.CidrBlock, 2, 10]], 4, 8]
         AvailabilityZone: !Select
           # In the following list of AZs, select the index mapped from the ForEach letter
-          - !FindInMap [IndexMappings, Subnets, !Sub '${index}']
+          - !FindInMap [IndexMappings, AZ, !Sub '${az}']
           - !GetAZs ""
         Tags:
           - Key: Network
             Value: Public
           - Key: Name
-            Value: !Sub subnet-${ProjectName}-public-${index}-${Environment}
-    PublicSubnetRouteTableAssociation${index}:
+            Value: !Sub subnet-${ProjectName}-public-${az}-${Environment}
+    PublicSubnetRouteTableAssociation${az}:
       Type: AWS::EC2::SubnetRouteTableAssociation
       Properties:
-        SubnetId: {Ref: !Sub 'PublicSubnet${index}'}
+        SubnetId: {Ref: !Sub 'PublicSubnet${az}'}
         RouteTableId: !Ref PublicRouteTable
     # Private subnets and NAT instances
-    PrivateSubnet${index}:
+    PrivateSubnet${az}:
       Type: AWS::EC2::Subnet
       Properties:
         VpcId: !Ref VPC
         CidrBlock: !Select
           # In the following list of subnet, select the index mapped from the ForEach letter
-          - !FindInMap [IndexMappings, Subnets, !Sub '${index}']
+          - !FindInMap [IndexMappings, AZ, !Sub '${az}']
           # The VPC will be devided in 8 subnets
           # This result in the list of the last 4 subnets
           - !Cidr [!Select [1, !Cidr [!GetAtt VPC.CidrBlock, 2, 10]], 4, 8]
         AvailabilityZone: !Select
           # In the following list of AZs, select the index mapped from the ForEach letter
-          - !FindInMap [IndexMappings, Subnets, !Sub '${index}']
+          - !FindInMap [IndexMappings, AZ, !Sub '${az}']
           - !GetAZs ""
         Tags:
           - Key: Network
             Value: Private
           - Key: Name
-            Value: !Sub subnet-${ProjectName}-private-${index}-${Environment}
-    NATInstance${index}:
+            Value: !Sub subnet-${ProjectName}-private-${az}-${Environment}
+    NATInstance${az}:
       Type: AWS::EC2::Instance
       Properties:
         NetworkInterfaces:
           - DeviceIndex: 0
-            SubnetId: {Ref: !Sub 'PublicSubnet${index}'}
+            SubnetId: {Ref: !Sub 'PublicSubnet${az}'}
         SourceDestCheck: false
         LaunchTemplate:
           LaunchTemplateId: !Ref NATInstanceLaunchTemplate
           Version: !GetAtt NATInstanceLaunchTemplate.LatestVersionNumber
         Tags:
           - Key: Name
-            Value: !Sub ec2-${ProjectName}-nat-${index}-${Environment}
-    PrivateRouteTable${index}:
+            Value: !Sub ec2-${ProjectName}-nat-${az}-${Environment}
+    PrivateRouteTable${az}:
       Type: AWS::EC2::RouteTable
       Properties:
         VpcId: !Ref VPC
         Tags:
           - Key: Name
-            Value: !Sub rt-${ProjectName}-private-${index}-${Environment}
-    PrivateRoute${index}:
+            Value: !Sub rt-${ProjectName}-private-${az}-${Environment}
+    PrivateRoute${az}:
       Type: AWS::EC2::Route
       Properties:
-         RouteTableId: {Ref: !Sub 'PrivateRouteTable${index}'}
+         RouteTableId: {Ref: !Sub 'PrivateRouteTable${az}'}
          DestinationCidrBlock: 0.0.0.0/0
-         InstanceId: {Ref: !Sub 'NATInstance${index}'}
-    PrivateSubnetRouteTableAssociation${index}:
+         InstanceId: {Ref: !Sub 'NATInstance${az}'}
+    PrivateSubnetRouteTableAssociation${az}:
       Type: AWS::EC2::SubnetRouteTableAssociation
       Properties:
-        SubnetId: {Ref: !Sub 'PrivateSubnet${index}'}
-        RouteTableId: {Ref: !Sub 'PrivateRouteTable${index}'}
+        SubnetId: {Ref: !Sub 'PrivateSubnet${az}'}
+        RouteTableId: {Ref: !Sub 'PrivateRouteTable${az}'}
 
   # Internet gateway and pub routes
   IGW:
@@ -228,13 +228,13 @@ Outputs:
       Name: !Sub ${ProjectName}:${Environment}:VPCCIDR
 
   # Subnet IDs outputs
-  Fn::ForEach::SubnetOutputs:
-  - index
-  - !FindInMap [IndexMappings, Subnets, list]
+  Fn::ForEach::AZOutputs:
+  - az
+  - !FindInMap [IndexMappings, AZ, list]
   - Fn::ForEach::SubnetTypes:
     - type
     - [Public, Private]
-    - ${type}Subnet${index}ID:
-        Value: {Ref: !Sub '${type}Subnet${index}'}
+    - ${type}Subnet${az}ID:
+        Value: {Ref: !Sub '${type}Subnet${az}'}
         Export:
-          Name: !Sub ${ProjectName}:${Environment}:${type}Subnet${index}ID
+          Name: !Sub ${ProjectName}:${Environment}:${type}Subnet${az}ID
